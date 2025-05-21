@@ -1,0 +1,208 @@
+#################### Written By Dr. Ajmalghan M, Gleam Innovations pvt lmt, Banaglore##########################
+############################## Email: ajmalghan.m@gmail.com ###################################################
+#!/bin/bash
+#SBATCH --job-name=bdd_li_post
+#SBATCH --partition=hm
+#SBATCH --nodes=1
+#SBATCH --ntasks=16
+#SBATCH --time=04:00:00
+#SBATCH --output=bdd_li_post.%j.out
+#SBATCH --error=bdd_li_post.%j.err
+#SBATCH --exclusive
+#
+#  POST-PROCESSING & BATTERY-PARAMETER COLLECTION
+#  —————————————————————————————————————————————————
+
+ml purge
+ml openmpi/4.1.1
+ml spack
+. /home/apps/spack/share/spack/setup-env.sh
+spack load /mte7zei     # Quantum-ESPRESSO
+export OMP_NUM_THREADS=1
+cd  $SLURM_SUBMIT_DIR
+ulimit -s unlimited
+
+###############################################################################
+#  0.  PARAMETERS / PATHS
+###############################################################################
+PSEUDO_DIR="/home/username/pseudo"
+LI_PSEUDO="Li.pbe-s-kjpaw_psl.1.0.0.UPF"
+C_PSEUDO="C.pbe-n-kjpaw_psl.1.0.0.UPF"
+B_PSEUDO="B.pbe-n-kjpaw_psl.1.0.0.UPF"
+
+ECUTWFC=60
+ECUTRHO=240
+SMEAR="occupations='smearing', smearing='mv', degauss=0.001"
+K_DOS="12 12 12 0 0 0"
+
+Ry2eV=13.6056980659
+FARADAY_eV=26801     # one Faraday expressed in eV (used in voltage calc)
+
+pw ()   { mpirun -np $SLURM_NTASKS pw.x   -in "$1" > "$2" ; }
+dos ()  {               dos.x  -in "$1" > "$2" ; }
+neb ()  { mpirun -np $SLURM_NTASKS neb.x -in "$1" > "$2" ; }
+
+###############################################################################
+#  1.  DENSE nSCF  +  DOS   for Li–BDD
+###############################################################################
+cat > nscf.in <<EOF
+&CONTROL
+  calculation='nscf', restart_mode='restart',
+  prefix='bdd_li_scf', outdir='./bdd_li_scf'
+/
+&SYSTEM
+  ibrav=0, nat=17, ntyp=3,
+  ecutwfc=$ECUTWFC, ecutrho=$ECUTRHO,
+  $SMEAR
+/
+&ELECTRONS /
+K_POINTS automatic
+ $K_DOS
+EOF
+echo ">>> Running dense nSCF for DOS"
+pw  nscf.in nscf.out
+
+cat > dos.in <<EOF
+&DOS
+  outdir='./bdd_li_scf', prefix='bdd_li_scf',
+  fildos='Li_BDD.dos', Emin=-20.0, Emax=10.0, DeltaE=0.02
+/
+EOF
+echo ">>> Calculating DOS"
+dos dos.in dos.out
+###############################################################################
+#  2.  7-IMAGE NEB  BETWEEN  TWO  TETRAHEDRAL  SITES
+# 2.1  Grab the relaxed coordinates of Li-BDD (17 atoms)
+###############################################################################
+#  – take the last occurrence of  ATOMIC_POSITIONS (crystal)
+#  – keep the next 17 *non-blank* lines (exactly nat atoms)
+
+line=$(grep -n "ATOMIC_POSITIONS (crystal)" bdd_li_relax.out | tail -1 | cut -d: -f1)
+tail -n +"$((line+1))" bdd_li_relax.out | awk 'NF>0' | head -n 17 > coords.ref
+
+# split reference into “all except Li” and the one Li line
+grep -v "^ *Li" coords.ref           > others.tmp
+grep    "^ *Li" coords.ref | head -1 > li.tmp
+
+# store Li y and z (we will only move x)
+LI_Y=$(awk '{print $3}' li.tmp)
+LI_Z=$(awk '{print $4}' li.tmp)
+###############################################################################
+# 2.2  Create image directories and coordinate files
+###############################################################################
+NIMG=7                               # total images *including* initial & final
+
+rm -rf neb_images
+mkdir  neb_images
+
+# QE expects image directories to start from 01, 02, …, NIMG
+for i in $(seq 0 $((NIMG-1))); do
+    frac=$(echo "$i / ($NIMG-1)" | bc -l)        # linear interpolation 0 … 1
+    LIX=$(echo "0.25 + 0.50 * $frac" | bc -l)    # Li hops 0.25 → 0.75
+
+    imgdir=$(printf "neb_images/image%02d" $((i+1)))
+    mkdir -p "$imgdir"
+
+    {
+        echo "ATOMIC_POSITIONS (crystal)"
+        cat  others.tmp
+        printf "Li  %.10f  %.10f  %.10f\n"  "$LIX" "$LI_Y" "$LI_Z"
+    } > "$imgdir/pos"                            # neb.x looks for ‘pos’ here
+done
+
+###############################################################################
+# 2.3  Write the NEB input file
+###############################################################################
+# copy the *last* CELL_PARAMETERS (3 lines) from the relaxation output
+line=$(grep -n "CELL_PARAMETERS" bdd_li_relax.out | tail -1 | cut -d: -f1)
+tail -n +"$((line+1))" bdd_li_relax.out | head -n 3 > cell.tmp
+
+cat > neb.in <<EOF
+&CONTROL
+   calculation = 'neb',
+   prefix      = 'BDDneb',
+   outdir      = './BDDneb',
+   pseudo_dir  = './pseudo'
+/
+&SYSTEM
+   ibrav    = 0,
+   nat      = 17,
+   ntyp     = 3,
+   ecutwfc  = \$ECUTWFC,
+   ecutrho  = \$ECUTRHO,
+   \$SMEAR
+/
+&ELECTRONS
+   conv_thr = 1.0d-8
+/
+&PATH
+   restart_mode  = 'from_scratch',
+   num_of_images = $NIMG,
+   nstep         = 120,
+   opt_scheme    = 'broyden',
+   path_thr      = 5.d-4
+/
+ATOMIC_SPECIES
+C   12.011  \$C_PSEUDO
+B   10.811  \$B_PSEUDO
+Li   6.94   \$LI_PSEUDO
+
+CELL_PARAMETERS (angstrom)
+$(cat cell.tmp)
+EOF
+rm -f cell.tmp others.tmp li.tmp coords.ref      # clean up helpers
+
+###############################################################################
+# 2.4  Run NEB and extract the migration barrier
+###############################################################################
+echo ">>> Running NEB with $NIMG images"
+neb.x -in neb.in > neb.out
+
+E_MIG_eV=\$(grep "neb: energy barrier" neb.out | awk '{print \$(NF-1)}')
+echo "∆E_mig  = \${E_MIG_eV} eV"
+
+###############################################################################
+#  3.  PARSE  TOTAL  ENERGIES  &  CALCULATE  BATTERY  METRICS
+###############################################################################
+E_BDD_Ry=$(grep -m1 "!" bdd_relax.out      | awk '{print $5}')
+E_BDD_eV=$(echo "$E_BDD_Ry * $Ry2eV" | bc -l)
+E_BDDLI_Ry=$(grep "!" bdd_li_relax.out | tail -1 | awk '{print $5}')
+E_BDDLI_eV=$(echo "$E_BDDLI_Ry * $Ry2eV" | bc -l)
+
+E_LiBulk_Ry=$(grep "!" li_bcc.out | tail -1 | awk '{print $5}')
+E_LiBulk_eV=$(echo "$E_LiBulk_Ry * $Ry2eV" | bc -l)
+
+#  ΔE_bind  (1 Li in 2×2×2 cell → LiC15B)
+DELTA_E=$(echo "$E_BDDLI_eV - $E_BDD_eV - $E_LiBulk_eV" | bc -l)
+
+#  Average voltage   V = –ΔG / F   (here ΔG ≈ ΔE at 0 K)
+VOLTS=$(echo "-1 * $DELTA_E / $FARADAY_eV" | bc -l)
+
+#  Theoretical gravimetric capacity  (Li1 C15 B  ->  x = 1)
+M_MOLAR=$(echo "15*12.011 + 10.811 + 6.94" | bc -l)
+CAP_mAhg=$(echo "(1 * 96485)/(3.6 * $M_MOLAR)" | bc -l)
+
+#  Volumetric expansion  ΔV/V
+V0=$(grep -m1 "volume =" bdd_relax.out   | awk '{print $3}')
+V1=$(grep -m1 "volume =" bdd_li_relax.out| awk '{print $3}')
+VOL_EXP=$(echo "(($V1 - $V0)/$V0)*100" | bc -l)
+
+###############################################################################
+#  4.  SUMMARY  REPORT
+###############################################################################
+cat <<REPORT
+
+========================================
+   Li  IN  BORON-DOPED  DIAMOND  (2×2×2)
+   Battery-Relevant DFT Quantities
+========================================
+1 Li binding energy             :  $DELTA_E  eV   (negative = exothermic)
+Average intercalation voltage   :  $VOLTS   V vs Li/Li+
+Theoretical gravimetric capacity:  $CAP_mAhg  mA h g^-1
+Volume expansion upon lithiation:  $VOL_EXP  %
+Li migration barrier (NEB)      :  $E_MIG_eV  eV
+----------------------------------------
+Electronic DOS file  :  Li_BDD.dos
+NEB energies (profile): path.in / neb.dat
+========================================
+REPORT
